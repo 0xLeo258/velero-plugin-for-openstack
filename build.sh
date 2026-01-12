@@ -1,0 +1,1 @@
+docker buildx build --platform linux/amd64,linux/arm64 -t guswong/velero-plugin-for-openstack:v0.8.2 --push .

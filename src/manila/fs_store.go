@@ -404,25 +404,20 @@ func (b *FSStore) cloneShare(logWithFields *logrus.Entry, shareID, shareName, sh
 	// Create Manila Share from snapshot (backup)
 	logWithFields.Infof("Starting to create share from intermediate snapshot")
 	opts := &shares.CreateOpts{
-		ShareProto:       snapshot.ShareProto,
-		Size:             snapshot.Size,
-		AvailabilityZone: shareAZ,
-		Name:             shareName,
-		Description:      shareDesc,
-		SnapshotID:       snapshot.ID,
-		Metadata:         utils.Merge(originShare.Metadata, tags),
-	}
-	if b.enforceAZ && shareAZ != "" && originShare.AvailabilityZone != shareAZ {
-		// omit AZ and move the share to a new AZ later
-		// see https://github.com/openstack/manila/blob/stable/zed/manila/share/api.py#L258-L266
-		opts.AvailabilityZone = ""
+    	ShareProto:       snapshot.ShareProto,
+    	Size:             snapshot.Size,
+		// patch HC01-613193: use original share AZ to avoid zone mismatch error
+    	AvailabilityZone: originShare.AvailabilityZone,
+    	Name:             shareName,
+    	Description:      shareDesc,
+    	SnapshotID:       snapshot.ID,
+    	Metadata:         utils.Merge(originShare.Metadata, tags),
 	}
 	share, err := shares.Create(context.TODO(), b.client, opts).Extract()
 	if err != nil {
-		logWithFields.Errorf("failed to create share clone from intermediate snapshot")
-		return "", "", fmt.Errorf("failed to create share clone %v from intermediate snapshot %v: %w", shareName, snapshot.ID, err)
+    	logWithFields.Errorf("failed to create share clone from intermediate snapshot")
+    	return "", "", fmt.Errorf("failed to create share clone %v from intermediate snapshot %v: %w", shareName, snapshot.ID, err)
 	}
-
 	// Make sure share clone is in available status
 	logWithFields.Info("Waiting for share clone to be in 'available' status")
 
@@ -450,7 +445,7 @@ func (b *FSStore) cloneShare(logWithFields *logrus.Entry, shareID, shareName, sh
 
 	// migrate a share to the desired AZ
 	if b.enforceAZ && shareAZ != "" && share.AvailabilityZone != shareAZ {
-		err = b.changeAZ(logWithFields, shareID, shareAZ)
+		err = b.changeAZ(logWithFields, share.ID, shareAZ)
 		if err != nil {
 			logWithFields.Errorf("failed to move a share to the target %s availability zone", shareAZ)
 			return share.ID, shareAccessID, fmt.Errorf("failed to move a share to the target %s availability zone: %w", shareAZ, err)
