@@ -26,7 +26,7 @@ ENV GOOS=${TARGETOS} \
 COPY . /go/src/velero-plugin-for-openstack
 WORKDIR /go/src/velero-plugin-for-openstack
 
-RUN CGO_ENABLED=0 go build -v -o /go/bin/velero-plugin-for-openstack ./velero-plugin-for-openstack
+RUN CGO_ENABLED=0 go build -v -o /go/bin/velero-plugin-for-openstack ./src
 
 FROM scratch
 COPY --from=build /go/bin/velero-plugin-for-openstack /plugins/velero-plugin-for-openstack
