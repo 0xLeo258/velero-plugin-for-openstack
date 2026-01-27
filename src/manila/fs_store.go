@@ -227,7 +227,7 @@ func (b *FSStore) createVolumeFromSnapshot(snapshotID, volumeType, volumeAZ stri
 		"method":          b.config["method"],
 	})
 	logWithFields.Info("FSStore.CreateVolumeFromSnapshot called")
-
+	
 	volumeName := fmt.Sprintf("%s.backup.%s", snapshotID, strconv.FormatUint(utils.Rand.Uint64(), 10))
 	logWithFields.Info("Waiting for snapshot to be in 'available' status")
 
@@ -314,9 +314,9 @@ func (b *FSStore) createVolumeFromSnapshot(snapshotID, volumeType, volumeAZ stri
 	return share.ID, nil
 }
 
-func (b *FSStore) createVolumeFromClone(cloneID, volumeType, volumeAZ string) (string, error) {
+func (b *FSStore) createVolumeFromClone(snapshotID, volumeType, volumeAZ string) (string, error) {
 	logWithFields := b.log.WithFields(logrus.Fields{
-		"cloneID":         cloneID,
+		"snapshotID":      snapshotID,
 		"volumeType":      volumeType,
 		"volumeAZ":        volumeAZ,
 		"shareTimeout":    b.shareTimeout,
@@ -326,18 +326,84 @@ func (b *FSStore) createVolumeFromClone(cloneID, volumeType, volumeAZ string) (s
 	})
 	logWithFields.Info("FSStore.CreateVolumeFromSnapshot called")
 
-	volumeName := fmt.Sprintf("%s.backup.%s", cloneID, strconv.FormatUint(utils.Rand.Uint64(), 10))
-	volumeDesc := "Velero backup from share clone"
-	shareID, shareAccessID, err := b.cloneShare(logWithFields, cloneID, volumeName, volumeDesc, volumeAZ, nil)
+	volumeName := fmt.Sprintf("%s.restore.%s", snapshotID, strconv.FormatUint(utils.Rand.Uint64(), 10))
+	logWithFields.Info("Waiting for snapshot to be in 'available' status")
+
+	snapshot, err := b.waitForSnapshotStatus(snapshotID, snapshotStatuses, b.snapshotTimeout)
 	if err != nil {
-		return shareID, err
+		logWithFields.Error("snapshot didn't get into 'available' status within the time limit")
+		return "", fmt.Errorf("snapshot %v didn't get into 'available' status within the time limit: %w", snapshotID, err)
+	}
+	logWithFields.Info("Snapshot is in 'available' status")
+
+	// Get original share with its metadata
+	originShare, err := shares.Get(context.TODO(), b.client, snapshot.ShareID).Extract()
+	if err != nil {
+		logWithFields.Errorf("failed to get original share %v from manila", snapshot.ShareID)
+		return "", fmt.Errorf("failed to get original share %v from manila: %w", snapshot.ShareID, err)
+	}
+
+	// Get original share access rule
+	rule, err := b.getShareAccessRule(logWithFields, snapshot.ShareID)
+	if err != nil {
+		return "", err
+	}
+
+	// Create Manila Share from snapshot (restore)
+	logWithFields.Infof("Starting to create share from snapshot")
+	opts := &shares.CreateOpts{
+		ShareProto:       snapshot.ShareProto,
+		Size:             snapshot.Size,
+		AvailabilityZone: originShare.AvailabilityZone,
+		Name:             volumeName,
+		Description:      "Velero restore from snapshot",
+		SnapshotID:       snapshotID,
+		Metadata:         originShare.Metadata,
+	}
+	share, err := shares.Create(context.TODO(), b.client, opts).Extract()
+	if err != nil {
+		logWithFields.Errorf("failed to create share from snapshot")
+		return "", fmt.Errorf("failed to create share %v from snapshot %v: %w", volumeName, snapshotID, err)
+	}
+
+	// Make sure share is in available status
+	logWithFields.Info("Waiting for share to be in 'available' status")
+	_, err = b.waitForShareStatus(share.ID, shareStatuses, b.cloneTimeout)
+	if err != nil {
+		logWithFields.Error("share didn't get into 'available' status within the time limit")
+		return share.ID, fmt.Errorf("share %v didn't get into 'available' status within the time limit: %w", share.ID, err)
+	}
+
+	var shareAccessID string
+	if rule != nil {
+		// Grant the only one supported share access from the original share
+		accessOpts := &shares.GrantAccessOpts{
+			AccessType:  rule.AccessType,
+			AccessTo:    rule.AccessTo,
+			AccessLevel: rule.AccessLevel,
+		}
+		shareAccess, err := shares.GrantAccess(context.TODO(), b.client, share.ID, accessOpts).Extract()
+		if err != nil {
+			logWithFields.Error("failed to grant an access to manila share")
+			return share.ID, fmt.Errorf("failed to grant an access to manila share %v: %w", share.ID, err)
+		}
+		shareAccessID = shareAccess.ID
+	}
+
+	// Migrate share to the desired AZ if needed
+	if b.enforceAZ && volumeAZ != "" && share.AvailabilityZone != volumeAZ {
+		err = b.changeAZ(logWithFields, share.ID, volumeAZ)
+		if err != nil {
+			logWithFields.Errorf("failed to move a share to the target %s availability zone", volumeAZ)
+			return share.ID, fmt.Errorf("failed to move a share to the target %s availability zone: %w", volumeAZ, err)
+		}
 	}
 
 	logWithFields.WithFields(logrus.Fields{
-		"shareID":       shareID,
+		"shareID":       share.ID,
 		"shareAccessID": shareAccessID,
-	}).Info("Backup share was created")
-	return shareID, nil
+	}).Info("Restore share was created")
+	return share.ID, nil
 }
 
 func (b *FSStore) cloneShare(logWithFields *logrus.Entry, shareID, shareName, shareDesc, shareAZ string, tags map[string]string) (string, string, error) {
@@ -545,9 +611,9 @@ func (b *FSStore) createSnapshot(volumeID, volumeAZ string, tags map[string]stri
 }
 
 func (b *FSStore) createClone(volumeID, volumeAZ string, tags map[string]string) (string, error) {
-	cloneName := fmt.Sprintf("%s.clone.%s", volumeID, strconv.FormatUint(utils.Rand.Uint64(), 10))
+	snapshotName := fmt.Sprintf("%s.clone.%s", volumeID, strconv.FormatUint(utils.Rand.Uint64(), 10))
 	logWithFields := b.log.WithFields(logrus.Fields{
-		"cloneName":       cloneName,
+		"snapshotName":    snapshotName,
 		"volumeID":        volumeID,
 		"volumeAZ":        volumeAZ,
 		"tags":            tags,
@@ -556,16 +622,40 @@ func (b *FSStore) createClone(volumeID, volumeAZ string, tags map[string]string)
 	})
 	logWithFields.Info("FSStore.CreateSnapshot called")
 
-	cloneDesc := "Velero share clone"
-	cloneID, _, err := b.cloneShare(logWithFields, volumeID, cloneName, cloneDesc, volumeAZ, tags)
+	// Make sure source share is in available status
+	logWithFields.Info("Waiting for source share to be in 'available' status")
+	_, err := b.waitForShareStatus(volumeID, shareStatuses, b.shareTimeout)
 	if err != nil {
-		return cloneID, err
+		logWithFields.Error("source share didn't get into 'available' status within the time limit")
+		return "", fmt.Errorf("source share %v didn't get into 'available' status within the time limit: %w", volumeID, err)
+	}
+	logWithFields.Info("Source share is in 'available' status")
+
+	// Create snapshot for backup
+	snapOpts := &snapshots.CreateOpts{
+		Name:        snapshotName,
+		Description: "Velero backup snapshot",
+		ShareID:     volumeID,
+	}
+	snapshot, err := snapshots.Create(context.TODO(), b.client, snapOpts).Extract()
+	if err != nil {
+		logWithFields.Error("failed to create backup snapshot from the source share")
+		return "", fmt.Errorf("failed to create backup snapshot from %v source share: %w", volumeID, err)
 	}
 
+	// Make sure snapshot is in available status
+	logWithFields.Info("Waiting for backup snapshot to be in 'available' status")
+	_, err = b.waitForSnapshotStatus(snapshot.ID, snapshotStatuses, b.snapshotTimeout)
+	if err != nil {
+		logWithFields.Error("backup snapshot didn't get into 'available' status within the time limit")
+		return snapshot.ID, fmt.Errorf("backup snapshot %v didn't get into 'available' status within the time limit: %w", snapshot.ID, err)
+	}
+	logWithFields.Info("Backup snapshot is in 'available' status")
+
 	logWithFields.WithFields(logrus.Fields{
-		"cloneID": cloneID,
-	}).Info("Share clone finished successfuly")
-	return cloneID, nil
+		"snapshotID": snapshot.ID,
+	}).Info("Backup snapshot finished successfully")
+	return snapshot.ID, nil
 }
 
 // DeleteSnapshot deletes the specified volume snapshot.
@@ -584,14 +674,34 @@ func (b *FSStore) deleteSnapshot(snapshotID string) error {
 		"method":     b.config["method"],
 	})
 	logWithFields.Info("FSStore.DeleteSnapshot called")
-
+	snapshot, err := snapshots.Get(context.TODO(), b.client, snapshotID).Extract()
+	if err != nil {
+		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+			logWithFields.Info("Getting snapshot error")
+			return nil
+		}
+		logWithFields.Error("failed to get snapshot")
+		return fmt.Errorf("failed to get snapshot %v: %w", snapshotID, err)
+	}
+	sourceShareID := snapshot.ShareID
+	listOpts := snapshots.ListOpts{
+		ShareID: sourceShareID,
+	}
+	pages, err := snapshots.ListDetail(b.client, listOpts).AllPages(context.TODO())
+	if err != nil {
+		return fmt.Errorf("failed to list %s share snapshots: %w", sourceShareID, err)
+	}
+	allSnapshots, err := snapshots.ExtractSnapshots(pages)
+	if err != nil {
+		return fmt.Errorf("failed to extract %s share snapshots: %w", sourceShareID, err)
+	}
 	// Delete snapshot from Manila
 	if b.ensureDeleted {
 		logWithFields.Infof("waiting for a %s snapshot to be deleted", snapshotID)
 		return b.ensureSnapshotDeleted(logWithFields, snapshotID, b.snapshotTimeout)
 	}
 
-	err := snapshots.Delete(context.TODO(), b.client, snapshotID).ExtractErr()
+	err = snapshots.Delete(context.TODO(), b.client, snapshotID).ExtractErr()
 	if err != nil {
 		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
 			logWithFields.Info("snapshot is already deleted")
@@ -600,7 +710,21 @@ func (b *FSStore) deleteSnapshot(snapshotID string) error {
 		logWithFields.Error("failed to delete snapshot")
 		return fmt.Errorf("failed to delete snapshot %v: %w", snapshotID, err)
 	}
-
+	
+	if len(allSnapshots) <= 1 {
+		logWithFields.Infof("Only 1 snapshot remains, cascade delete the share: %s", sourceShareID)
+		err = shares.Delete(context.TODO(), b.client, sourceShareID).ExtractErr()
+		if err != nil {
+		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+			logWithFields.Info("Share is already deleted")
+			return nil
+		}
+		logWithFields.Error("failed to delete share")
+		return fmt.Errorf("failed to delete share %v: %w", sourceShareID, err)
+	}
+	}else{
+		logWithFields.Infof("More than 1 snapshot remains, only delete the snapshot: %s", snapshotID)
+	}
 	return nil
 }
 
@@ -655,7 +779,7 @@ func (b *FSStore) deleteSnapshots(logWithFields *logrus.Entry, shareID string) e
 	if err != nil {
 		return fmt.Errorf("failed to extract %s share snapshots: %w", shareID, err)
 	}
-
+	
 	wg := sync.WaitGroup{}
 	errs := make(chan error, len(allSnapshots))
 	deleteSnapshot := func(snapshotID string) {

@@ -16,6 +16,7 @@ func main() {
 		RegisterVolumeSnapshotter("community.openstack.org/openstack", newCinderBlockStore).
 		RegisterVolumeSnapshotter("community.openstack.org/openstack-cinder", newCinderBlockStore).
 		RegisterVolumeSnapshotter("community.openstack.org/openstack-manila", newManilaFSStore).
+		// RegisterRestoreItemAction("community.openstack.org/openstack-manila", newRestoreItemAction).
 		Serve()
 }
 
@@ -29,4 +30,8 @@ func newCinderBlockStore(logger logrus.FieldLogger) (interface{}, error) {
 
 func newManilaFSStore(logger logrus.FieldLogger) (interface{}, error) {
 	return manila.NewFSStore(logger), nil
+}
+
+func newRestoreItemAction(logger logrus.FieldLogger) (interface{}, error) {
+	return manila.NewRestoreItemAction(logger), nil
 }
