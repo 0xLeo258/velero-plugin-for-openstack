@@ -778,8 +778,13 @@ func (b *FSStore) SetVolumeID(unstructuredPV runtime.Unstructured, volumeID stri
 
 	pv.Spec.CSI.VolumeHandle = volumeID
 	pv.Spec.CSI.VolumeAttributes["shareID"] = volumeID
+	// shareAccessID was renamed to shareAccessIDs upstream
+	// (cloud-provider-openstack#2915); newer Manila CSI rejects PVs that
+	// carry both. Drop the legacy key on every restore so the restored PV
+	// only carries the current one.
+	delete(pv.Spec.CSI.VolumeAttributes, "shareAccessID")
 	if rule != nil {
-		pv.Spec.CSI.VolumeAttributes["shareAccessID"] = rule.ID
+		pv.Spec.CSI.VolumeAttributes["shareAccessIDs"] = rule.ID
 	}
 
 	res, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pv)
