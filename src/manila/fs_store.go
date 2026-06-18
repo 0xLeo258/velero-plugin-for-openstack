@@ -65,7 +65,18 @@ var (
 	replicaInSyncStates = []string{
 		"in_sync",
 	}
+	// in-flight share access rule states — a grant transitions
+	// new → queued_to_apply → applying → active before it is usable.
+	//   https://github.com/openstack/manila/blob/master/api-ref/source/share-access-rules.inc
+	accessRuleInFlightStates = []string{
+		"new",
+		"queued_to_apply",
+		"applying",
+	}
 )
+
+// active share access rule state.
+const accessRuleActiveState = "active"
 
 // FSStore is a plugin for containing state for the Manila Shared Filesystem
 type FSStore struct {
@@ -246,8 +257,8 @@ func (b *FSStore) createVolumeFromSnapshot(snapshotID, volumeType, volumeAZ stri
 		return "", fmt.Errorf("failed to get original share %v from manila: %w", snapshot.ShareID, err)
 	}
 
-	// get original share access rules
-	rules, err := b.getShareAccessRules(logWithFields, snapshot.ShareID)
+	// get original share access rules (active only — the source share is stable)
+	rules, err := b.getShareAccessRules(logWithFields, snapshot.ShareID, false)
 	if err != nil {
 		return "", err
 	}
@@ -346,8 +357,8 @@ func (b *FSStore) cloneShare(logWithFields *logrus.Entry, shareID, shareName, sh
 	}
 	logWithFields.Info("Source share clone is in 'available' status")
 
-	// get original share access rules
-	rules, err := b.getShareAccessRules(logWithFields, originShare.ID)
+	// get original share access rules (active only — the source share is stable)
+	rules, err := b.getShareAccessRules(logWithFields, originShare.ID, false)
 	if err != nil {
 		return "", "", err
 	}
@@ -759,11 +770,13 @@ func (b *FSStore) SetVolumeID(unstructuredPV runtime.Unstructured, volumeID stri
 		return nil, fmt.Errorf("PV driver ('spec.csi.driver') doesn't match supported driver (%s)", b.config["driver"])
 	}
 
-	// get share access rules already attached to the new share. Upstream
-	// CreateVolumeFromSnapshot/cloneShare grant copies of the original
-	// share's rules earlier in the restore flow, so this list is what we
-	// want to expose to the CSI node-plugin.
-	rules, err := b.getShareAccessRules(logWithFields, volumeID)
+	// get the rules already attached to the freshly-restored share.
+	// createVolumeFromSnapshot/cloneShare granted copies of the source rules
+	// earlier in the restore flow, possibly still in-flight, so includeInFlight
+	// exposes them to the CSI node-plugin (which waits for active at mount time).
+	// Residual gap: a rule that flips to error *after* this list call leaves a
+	// stale ID in shareAccessIDs until the next restore/reconcile.
+	rules, err := b.getShareAccessRules(logWithFields, volumeID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -919,15 +932,22 @@ func (b *FSStore) findShareActiveReplica(logWithFields *logrus.Entry, shareID st
 	return nil, allReplicas, nil
 }
 
-// getShareAccessRules returns all access rules attached to the share regardless
-// of state. Manila grants are asynchronous (new → queued_to_apply → applying →
-// active) and SetVolumeID runs immediately after the grant, so filtering on
-// State == "active" here would race the rule transitioning and silently drop
-// just-granted rules. The CSI node-plugin already waits for rules to become
-// active at mount time, so we include in-flight rules and only log a warning
-// for visibility.
-func (b *FSStore) getShareAccessRules(logWithFields *logrus.Entry, volumeID string) ([]shares.AccessRight, error) {
-	var raw interface{}
+// getShareAccessRules returns the access rules attached to the share, normalized
+// to []shares.AccessRight regardless of which Manila API served the request.
+//
+// active rules are always returned. error / denying / queued_to_deny rules are
+// always skipped and logged: they never converge to active, so copying them to a
+// new share or exposing them to the node-plugin is useless.
+//
+// includeInFlight controls in-flight rules (new / queued_to_apply / applying):
+//   - false when reading a stable source share to decide what to replicate; a
+//     source rule that is not yet active is anomalous, so skip it.
+//   - true when reading the freshly-restored share in SetVolumeID; grants issued
+//     moments earlier are still transitioning, and filtering them here would race
+//     the transition and silently drop just-granted rules. The CSI node-plugin
+//     waits for rules to reach active at mount time.
+func (b *FSStore) getShareAccessRules(logWithFields *logrus.Entry, volumeID string, includeInFlight bool) ([]shares.AccessRight, error) {
+	var raw any
 	var err error
 	if ok, _ := utils.CompareMicroversions("lte", getAccessRulesMicroversion, b.client.Microversion); ok {
 		raw, err = shareaccessrules.List(context.TODO(), b.client, volumeID).Extract()
@@ -940,23 +960,15 @@ func (b *FSStore) getShareAccessRules(logWithFields *logrus.Entry, volumeID stri
 		return nil, fmt.Errorf("failed to list share %v access rules from manila: %w", volumeID, err)
 	}
 
-	var out []shares.AccessRight
+	// normalize both API response types into a single slice
+	var all []shares.AccessRight
 	switch rules := raw.(type) {
 	case []shares.AccessRight:
-		for _, rule := range rules {
-			if rule.State != "active" {
-				logWithFields.Warnf("including non-active access rule %s on share %s (state=%s, type=%s, to=%s)",
-					rule.ID, volumeID, rule.State, rule.AccessType, rule.AccessTo)
-			}
-			out = append(out, rule)
-		}
+		all = rules
 	case []shareaccessrules.ShareAccess:
+		all = make([]shares.AccessRight, 0, len(rules))
 		for _, rule := range rules {
-			if rule.State != "active" {
-				logWithFields.Warnf("including non-active access rule %s on share %s (state=%s, type=%s, to=%s)",
-					rule.ID, volumeID, rule.State, rule.AccessType, rule.AccessTo)
-			}
-			out = append(out, shares.AccessRight{
+			all = append(all, shares.AccessRight{
 				ID:          rule.ID,
 				ShareID:     rule.ShareID,
 				AccessKey:   rule.AccessKey,
@@ -968,17 +980,33 @@ func (b *FSStore) getShareAccessRules(logWithFields *logrus.Entry, volumeID stri
 		}
 	}
 
+	out := make([]shares.AccessRight, 0, len(all))
+	for _, rule := range all {
+		switch {
+		case rule.State == accessRuleActiveState:
+			out = append(out, rule)
+		case includeInFlight && utils.SliceContains(accessRuleInFlightStates, rule.State):
+			logWithFields.Warnf("including in-flight access rule %s on share %s (state=%s, type=%s, to=%s)",
+				rule.ID, volumeID, rule.State, rule.AccessType, rule.AccessTo)
+			out = append(out, rule)
+		default:
+			logWithFields.Warnf("skipping access rule %s on share %s (state=%s, type=%s, to=%s)",
+				rule.ID, volumeID, rule.State, rule.AccessType, rule.AccessTo)
+		}
+	}
+
 	if len(out) == 0 {
-		logWithFields.Infof("no access rules found on share %v", volumeID)
+		logWithFields.Infof("no usable access rules found on share %v", volumeID)
 	}
 	return out, nil
 }
 
 // grantAllAccessRules grants every rule from origin onto the new share and
 // returns the IDs of the new access rules in the same order. On the first
-// failure it returns the IDs granted so far together with the error; partial
-// grants are intentionally left in place to mirror the existing single-rule
-// behaviour and avoid masking the underlying failure with revoke noise.
+// failure it logs any rules already granted — now orphaned on the share — for
+// operator cleanup and returns a nil slice with the error. Partial grants are
+// intentionally left in place to mirror the existing single-rule failure mode
+// (an orphaned share on failure) rather than adding best-effort revoke noise.
 func (b *FSStore) grantAllAccessRules(logWithFields *logrus.Entry, newShareID string, origin []shares.AccessRight) ([]string, error) {
 	granted := make([]string, 0, len(origin))
 	for _, rule := range origin {
@@ -989,9 +1017,13 @@ func (b *FSStore) grantAllAccessRules(logWithFields *logrus.Entry, newShareID st
 		}
 		access, err := shares.GrantAccess(context.TODO(), b.client, newShareID, opts).Extract()
 		if err != nil {
+			if len(granted) > 0 {
+				logWithFields.Warnf("share %s has %d orphaned access rule(s) granted before this failure: %s",
+					newShareID, len(granted), strings.Join(granted, ","))
+			}
 			logWithFields.Errorf("failed to grant access (type=%s, to=%s, level=%s) on share %s",
 				rule.AccessType, rule.AccessTo, rule.AccessLevel, newShareID)
-			return granted, fmt.Errorf("failed to grant access (type=%s, to=%s) on share %v: %w",
+			return nil, fmt.Errorf("failed to grant access (type=%s, to=%s) on share %v: %w",
 				rule.AccessType, rule.AccessTo, newShareID, err)
 		}
 		granted = append(granted, access.ID)
