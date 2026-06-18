@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/Lirt/velero-plugin-for-openstack/src/utils"
@@ -245,8 +246,8 @@ func (b *FSStore) createVolumeFromSnapshot(snapshotID, volumeType, volumeAZ stri
 		return "", fmt.Errorf("failed to get original share %v from manila: %w", snapshot.ShareID, err)
 	}
 
-	// get original share access rule
-	rule, err := b.getShareAccessRule(logWithFields, snapshot.ShareID)
+	// get original share access rules
+	rules, err := b.getShareAccessRules(logWithFields, snapshot.ShareID)
 	if err != nil {
 		return "", err
 	}
@@ -283,19 +284,13 @@ func (b *FSStore) createVolumeFromSnapshot(snapshotID, volumeType, volumeAZ stri
 	}
 
 	var shareAccessID string
-	if rule != nil {
-		// grant the only one supported share access from the original share
-		accessOpts := &shares.GrantAccessOpts{
-			AccessType:  rule.AccessType,
-			AccessTo:    rule.AccessTo,
-			AccessLevel: rule.AccessLevel,
-		}
-		shareAccess, err := shares.GrantAccess(context.TODO(), b.client, share.ID, accessOpts).Extract()
+	if len(rules) > 0 {
+		// replicate every access rule from the original share
+		grantedIDs, err := b.grantAllAccessRules(share.ID, rules)
 		if err != nil {
-			logWithFields.Error("failed to grant an access to manila share")
-			return share.ID, fmt.Errorf("failed to grant an access to manila share %v: %w", share.ID, err)
+			return share.ID, err
 		}
-		shareAccessID = shareAccess.ID
+		shareAccessID = strings.Join(grantedIDs, ",")
 	}
 
 	// migrate a share to the desired AZ
@@ -351,8 +346,8 @@ func (b *FSStore) cloneShare(logWithFields *logrus.Entry, shareID, shareName, sh
 	}
 	logWithFields.Info("Source share clone is in 'available' status")
 
-	// get original share access rule
-	rule, err := b.getShareAccessRule(logWithFields, originShare.ID)
+	// get original share access rules
+	rules, err := b.getShareAccessRules(logWithFields, originShare.ID)
 	if err != nil {
 		return "", "", err
 	}
@@ -433,19 +428,13 @@ func (b *FSStore) cloneShare(logWithFields *logrus.Entry, shareID, shareName, sh
 	}
 
 	var shareAccessID string
-	if rule != nil {
-		// grant the only one supported share access from the original share
-		accessOpts := &shares.GrantAccessOpts{
-			AccessType:  rule.AccessType,
-			AccessTo:    rule.AccessTo,
-			AccessLevel: rule.AccessLevel,
-		}
-		shareAccess, err := shares.GrantAccess(context.TODO(), b.client, share.ID, accessOpts).Extract()
+	if len(rules) > 0 {
+		// replicate every access rule from the original share
+		grantedIDs, err := b.grantAllAccessRules(share.ID, rules)
 		if err != nil {
-			logWithFields.Error("failed to grant an access to manila share clone")
-			return share.ID, "", fmt.Errorf("failed to grant an access to manila share clone %v: %w", share.ID, err)
+			return share.ID, "", err
 		}
-		shareAccessID = shareAccess.ID
+		shareAccessID = strings.Join(grantedIDs, ",")
 	}
 
 	// migrate a share to the desired AZ
@@ -770,16 +759,30 @@ func (b *FSStore) SetVolumeID(unstructuredPV runtime.Unstructured, volumeID stri
 		return nil, fmt.Errorf("PV driver ('spec.csi.driver') doesn't match supported driver (%s)", b.config["driver"])
 	}
 
-	// get share access rule
-	rule, err := b.getShareAccessRule(logWithFields, volumeID)
+	// get the access rules attached to the restored share so we can expose them
+	// to the CSI node-plugin
+	rules, err := b.getShareAccessRules(logWithFields, volumeID)
 	if err != nil {
 		return nil, err
 	}
 
 	pv.Spec.CSI.VolumeHandle = volumeID
 	pv.Spec.CSI.VolumeAttributes["shareID"] = volumeID
-	if rule != nil {
-		pv.Spec.CSI.VolumeAttributes["shareAccessID"] = rule.ID
+	// shareAccessID was renamed to shareAccessIDs upstream
+	// (cloud-provider-openstack#2915); newer Manila CSI rejects PVs that
+	// carry both. Drop the legacy key on every restore and write a CSV
+	// of access-rule IDs into the current key.
+	delete(pv.Spec.CSI.VolumeAttributes, "shareAccessID")
+	if len(rules) > 0 {
+		ids := make([]string, 0, len(rules))
+		for _, r := range rules {
+			ids = append(ids, r.ID)
+		}
+		pv.Spec.CSI.VolumeAttributes["shareAccessIDs"] = strings.Join(ids, ",")
+	} else {
+		// no rules on the new share — make sure stale value from the
+		// backed-up PV does not leak through
+		delete(pv.Spec.CSI.VolumeAttributes, "shareAccessIDs")
 	}
 
 	res, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pv)
@@ -914,28 +917,30 @@ func (b *FSStore) findShareActiveReplica(logWithFields *logrus.Entry, shareID st
 	return nil, allReplicas, nil
 }
 
-func (b *FSStore) getShareAccessRule(logWithFields *logrus.Entry, volumeID string) (*shares.AccessRight, error) {
-	var rules interface{}
+// getShareAccessRules returns all access rules attached to the share, normalized
+// to []shares.AccessRight regardless of which Manila API microversion served the
+// request.
+func (b *FSStore) getShareAccessRules(logWithFields *logrus.Entry, volumeID string) ([]shares.AccessRight, error) {
+	var raw any
 	var err error
 	if ok, _ := utils.CompareMicroversions("lte", getAccessRulesMicroversion, b.client.Microversion); ok {
-		rules, err = shareaccessrules.List(context.TODO(), b.client, volumeID).Extract()
+		raw, err = shareaccessrules.List(context.TODO(), b.client, volumeID).Extract()
 	} else {
 		// deprecated API call
-		rules, err = shares.ListAccessRights(context.TODO(), b.client, volumeID).Extract()
+		raw, err = shares.ListAccessRights(context.TODO(), b.client, volumeID).Extract()
 	}
 	if err != nil {
 		logWithFields.Errorf("failed to list share %v access rules from manila", volumeID)
 		return nil, fmt.Errorf("failed to list share %v access rules from manila: %w", volumeID, err)
 	}
 
-	switch rules := rules.(type) {
+	switch rules := raw.(type) {
 	case []shares.AccessRight:
-		for _, rule := range rules {
-			return &rule, nil
-		}
+		return rules, nil
 	case []shareaccessrules.ShareAccess:
+		out := make([]shares.AccessRight, 0, len(rules))
 		for _, rule := range rules {
-			return &shares.AccessRight{
+			out = append(out, shares.AccessRight{
 				ID:          rule.ID,
 				ShareID:     rule.ShareID,
 				AccessKey:   rule.AccessKey,
@@ -943,12 +948,32 @@ func (b *FSStore) getShareAccessRule(logWithFields *logrus.Entry, volumeID strin
 				AccessTo:    rule.AccessTo,
 				AccessType:  rule.AccessType,
 				State:       rule.State,
-			}, nil
+			})
 		}
+		return out, nil
 	}
 
-	logWithFields.Infof("cannot find share %v access rules from manila", volumeID)
 	return nil, nil
+}
+
+// grantAllAccessRules grants every given rule onto the share and returns the new
+// access rule IDs in order. On the first failure it returns the error; rules
+// already granted are left on the share, matching the orphan-on-failure
+// behaviour of the original single-rule restore.
+func (b *FSStore) grantAllAccessRules(shareID string, rules []shares.AccessRight) ([]string, error) {
+	ids := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		access, err := shares.GrantAccess(context.TODO(), b.client, shareID, &shares.GrantAccessOpts{
+			AccessType:  rule.AccessType,
+			AccessTo:    rule.AccessTo,
+			AccessLevel: rule.AccessLevel,
+		}).Extract()
+		if err != nil {
+			return nil, fmt.Errorf("failed to grant access to manila share %v: %w", shareID, err)
+		}
+		ids = append(ids, access.ID)
+	}
+	return ids, nil
 }
 
 func (b *FSStore) getManilaMicroversion() (string, error) {
